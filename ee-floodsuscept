@@ -1,0 +1,317 @@
+Map.setOptions('SATELLITE')
+var masking = function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+};
+
+var s2a = ee.ImageCollection("COPERNICUS/S2_SR")
+            .filterBounds(sulsel)
+            .filterDate('2019-01-01', '2022-02-28')
+            .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 10)
+            .map(masking);
+
+var visparam = {
+  min: 0.0,
+  max: 0.5,
+  bands: ['B11', 'B8', 'B3'],
+};
+
+Map.centerObject(sulsel, 8);
+
+var mosaic = s2a.mosaic().select(['B11', 'B8', 'B3']);
+var image = mosaic.clip(sulsel);
+// Map.addLayer(image, visparam, 'Mosaic (B11, B8, B3)');
+
+var training = image.sample({
+  region: sulsel,
+  scale: 30,
+  numPixels: 5000
+});
+
+// Instantiate the clusterer and train it.
+var clusterer = ee.Clusterer.wekaKMeans(7).train(training);
+
+// Cluster the input using the trained clusterer.
+var result = image.cluster(clusterer);
+// print(result)
+// Display the clusters with random colors.
+
+var resremap = result.remap([0, 1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7]);
+var landcover = resremap.randomVisualizer().clip(sulsel);
+// Map.addLayer(landcover, {}, 'Land Cover');
+
+var srtm = ee.Image("USGS/SRTMGL1_003");
+var elev = srtm.clip(sulsel);
+
+var elev_reclass = ee.Image(0).rename('elevation')
+  .where(elev.gt(1201).and(elev.lte(2600)),1)
+  .where(elev.gt(651).and(elev.lte(1200)),2)
+  .where(elev.gt(301).and(elev.lte(650)),3)
+  .where(elev.gt(0).and(elev.lte(300)),4);
+
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.cmocean.Solar[7];
+
+Map.centerObject(sulsel, 8);
+Map.addLayer(elev_reclass.clip(sulsel), {min: 1, max: 4, palette: palette}, 'Elevation reclass', false)
+
+var slope = ee.Terrain.slope(srtm).clip(sulsel);
+var slope_reclass = ee.Image(0).rename('slope')
+  .where(slope.gt(19).and(slope.lte(78)),1)
+  .where(slope.gt(5).and(slope.lte(18)),2)
+  .where(slope.gt(3).and(slope.lte(4)),3)
+  .where(slope.gt(0).and(slope.lte(2)),4);
+
+Map.addLayer(slope_reclass.clip(sulsel), {min: 1, max: 4, palette: palette}, 'Slope reclass', false);
+
+var watermap = result.remap([0, 1, 2, 3, 4, 5, 6], [0, 0, 0, 0, 0, 0, 1]);
+var wb = watermap.randomVisualizer().clip(sulsel);
+// Map.addLayer(water, {}, 'Water');
+
+var dist_OW = wb.select('remapped')
+  .distance({kernel:ee.Kernel.euclidean(10000, "meters"), skipMasked:false})
+  .rename('distance')
+  .clip(sulsel);
+
+// print('distance to open water', dist_OW );
+
+// Display distance to open water areas
+// var imageVisParam = {
+//   opacity: 1,
+//   bands:["distance"],
+//   max: 512,
+//   palette:["22ff20","1a35ff","ffa925","ff0a36","2fe1ff","fd4bff"]};
+
+// Map.addLayer(dist_OW, imageVisParam, 'Distance to open water');
+
+var dist_ow_reclass = ee.Image(0).rename('dist')
+          .where(dist_OW.gt(4001).and(dist_OW.lte(10000)), 1)
+          .where(dist_OW.gt(801).and(dist_OW.lte(4000)), 2)
+          .where(dist_OW.gt(401).and(dist_OW.lte(800)), 3)
+          .where(dist_OW.gt(0).and(dist_OW.lte(400)), 4);
+
+// var palettes = require('users/gena/packages:palettes');
+
+// // Choose and define a palette
+// var palette = palettes.cmocean.Solar[7];
+
+// // Display the reclassified distance to open water areas
+// Map.addLayer(dist_ow_reclass.clip(sulsel), {min: 1, max: 4, palette: palette}, 'Distance to OW reclassified', false);
+
+/////////////////////////
+// Load the global the MERIT Hydro (Global Hydrography Datasets)
+var hand = ee.Image("MERIT/Hydro/v1_0_1");
+
+// Select Height Above Nearest Drainage (HAND)
+var hand = hand.select('hnd').clip(sulsel);
+
+// Reclassify Height Above Nearest Drainage (HAND) to the following classes
+// 1 = 89 - 1800; 2 = 29 - 90; 3 = 9 - 30; 4 = 0 -8
+var hand_reclass = ee.Image(1).rename('hnd')
+          .where(hand.gt(89).and(hand.lte(1800)), 1)
+          .where(hand.gt(29).and(hand.lte(90)), 2)
+          .where(hand.gt(9).and(hand.lte(30)), 3)
+          .where(hand.gt(0).and(hand.lte(8)), 4);
+
+// Note class 1 represents low flooding susceptibility, while class 4 represents high flooding susceptibility.
+
+// Load and define a continuous palette
+var palettes = require('users/gena/packages:palettes');
+
+// Choose and define a palette
+var palette = palettes.cmocean.Solar[7];
+
+// Display the reclassified HAND
+Map.addLayer(hand_reclass.clip(sulsel), {min: 1, max: 4, palette: palette}, 'Height Above the Nearest Drainage', false);
+
+// ////////////////
+// Calculate flood frequency from the JRC surface water
+var jrc = ee.ImageCollection("JRC/GSW1_0/MonthlyHistory");
+
+// Define study period
+var startDate = ee.Date.fromYMD(2000, 1, 1);
+var endDate = ee.Date.fromYMD(2022, 04, 30);
+
+// Filter JRC data by country and period
+var myjrc = jrc.filterBounds(sulsel).filterDate(startDate, endDate);
+
+// // Detect observations
+var myjrc = myjrc.map(function(img){
+  // observation is img > 0
+  var obs = img.gt(0);
+  return img.addBands(obs.rename('obs').set('system:time_start', img.get('system:time_start')));
+});
+
+// Detect all observations with water
+var myjrc = myjrc.map(function(img){
+  // if water
+  var water = img.select('water').eq(2);
+  return img.addBands(water.rename('onlywater').set('system:time_start', img.get('system:time_start')));
+});
+
+// Calculate the total amount of observations
+var totalObs = ee.Image(ee.ImageCollection(myjrc.select("obs")).sum().toFloat());
+
+// Calculate all observations with water
+var totalWater = ee.Image(ee.ImageCollection(myjrc.select("onlywater")).sum().toFloat());
+
+// Calculate the percentage of observations with water
+var floodfreq = totalWater.divide(totalObs).multiply(100);
+
+// Mask areas that are not water
+var myMask = floodfreq.eq(0).not();
+floodfreq = floodfreq.updateMask(myMask);
+
+// Add a palette and clip the image by country
+var vis1 = {min:0, max:90, palette:['8faff2','d742f4','001556','16558f']};
+
+// Map.centerObject(Country,5)
+Map.addLayer(floodfreq.clip(sulsel),vis1,"Flood frequency");
+
+////////////////////////
+// Modeling flood susceptibility using a simple weighted overlay analysis
+var image = floodfreq.addBands(landcover).addBands(elev_reclass).addBands(slope_reclass).addBands(dist_ow_reclass).addBands(hand_reclass);
+
+// Assign weights
+var Risk = image.expression(
+    '3 * floodfreq + 1 * landcover + 2 * elev_reclass + 2 * slope_reclass + 1 * dist_ow_reclass + 2 * hand_reclass', {
+      'floodfreq': image.select('onlywater'),
+      'landcover': image.select('remapped'),
+      'elev_reclass': image.select('elevation'),
+      'slope_reclass': image.select('slope'),
+      'dist_ow_reclass': image.select('dist'),
+      'hand_reclass': image.select('hnd')
+});
+
+
+// Display the flood susceptibility map
+var vis2 = {min:0, max:450, palette:['ffff00', 'ffa500', 'c00000']};
+Map.addLayer(Risk.clip(sulsel),vis2,"Flood susceptibility");
+
+// Set position of panel SUSCEPTIBILITY
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px 15px'
+  }
+});
+ 
+// Create legend title
+var legendTitle = ui.Label({
+  value: 'Flood Susceptibility',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+    }
+});
+ 
+// Add the title to the panel
+legend.add(legendTitle);
+ 
+// Create and style 1 row of the legend.
+var makeRow = function(color, name) {
+ 
+      // Create the label that is actually the colored box.
+      var colorBox = ui.Label({
+        style: {
+          backgroundColor: '#' + color,
+          // Use padding to give the box height and width.
+          padding: '8px',
+          margin: '0 0 4px 0'
+        }
+      });
+ 
+      // Create the label filled with the description text.
+      var description = ui.Label({
+        value: name,
+        style: {margin: '0 0 4px 6px'}
+      });
+ 
+      // return the panel
+      return ui.Panel({
+        widgets: [colorBox, description],
+        layout: ui.Panel.Layout.Flow('horizontal')
+      });
+};
+ 
+//  Palette with the colors
+var palette =['ffff00', 'ffa500', 'c00000'];
+ 
+// name of the legend
+var names = ['Low','Medium','High']
+ 
+// Add color and and names
+for (var i = 0; i < 3; i++) {
+  legend.add(makeRow(palette[i], names[i]));
+  }  
+ 
+// Add a legend to the map (alternatively, you can also print the legend to the console)
+Map.add(legend);
+
+// Set position of panel FREQUENCY
+var frlegend = ui.Panel({
+  style: {
+    position: 'top-left',
+    padding: '8px 15px'
+  }
+});
+ 
+// Create legend title
+var frlegendTitle = ui.Label({
+  value: 'Flood frequency',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+    }
+});
+ 
+// Add the title to the panel
+legend.add(frlegendTitle);
+ 
+// // Create and style 1 row of the legend.
+// var makeRow = function(color, name) {
+ 
+//       // Create the label that is actually the colored box.
+//       var colorBox = ui.Label({
+//         style: {
+//           backgroundColor: '#' + color,
+//           // Use padding to give the box height and width.
+//           padding: '8px',
+//           margin: '0 0 4px 0'
+//         }
+//       });
+ 
+//       // Create the label filled with the description text.
+//       var description = ui.Label({
+//         value: name,
+//         style: {margin: '0 0 4px 6px'}
+//       });
+ 
+//       // return the panel
+//       return ui.Panel({
+//         widgets: [colorBox, description],
+//         layout: ui.Panel.Layout.Flow('horizontal')
+//       });
+// };
+ 
+//  Palette with the colors
+var frpalette =['8faff2','d742f4','001556','16558f'];
+ 
+// name of the legend
+var frnames = ['Low','Medium','High', 'Water']
+ 
+// Add color and and names
+for (var i = 0; i < 4; i++) {
+  legend.add(makeRow(frpalette[i], frnames[i]));
+  }  
+ 
+// Add a legend to the map (alternatively, you can also print the legend to the console)
+Map.add(frlegend);
